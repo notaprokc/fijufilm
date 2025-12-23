@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>FujiSim WebCam</title>
+    <style>
+        body { margin: 0; background: #1a1a1a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: white; overflow: hidden; }
+        #container { position: relative; width: 100vw; height: 100vh; display: flex; flex-direction: column; }
+        video { display: none; }
+        canvas { width: 100%; height: 75vh; object-fit: cover; background: #000; }
+        
+        .controls { height: 25vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #111; padding-bottom: 20px; }
+        .mode-selector { display: flex; gap: 10px; margin-bottom: 20px; }
+        
+        button { 
+            background: #333; border: 1px solid #444; color: #aaa; padding: 10px 20px; 
+            border-radius: 5px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+            transition: all 0.2s;
+        }
+        button.active { background: #eee; color: #000; font-weight: bold; border-color: #fff; }
+        
+        .shutter-btn {
+            width: 70px; height: 70px; border-radius: 50%; background: white;
+            border: 5px solid #333; outline: none; box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        }
+        .shutter-btn:active { background: #ccc; transform: scale(0.95); }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <canvas id="glCanvas"></canvas>
+    <video id="video" autoplay playsinline></video>
+
+    <div class="controls">
+        <div class="mode-selector">
+            <button onclick="setMode('normal')" id="btn-normal" class="active">Normal</button>
+            <button onclick="setMode('chrome')" id="btn-chrome">Classic Chrome</button>
+            <button onclick="setMode('provia')" id="btn-provia">Provia</button>
+        </div>
+        <button class="shutter-btn" onclick="takePhoto()"></button>
+        <p id="status" style="font-size: 10px; margin-top: 10px; color: #666;">ENGINE: READY</p>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('glCanvas');
+    const gl = canvas.getContext('webgl');
+    const video = document.getElementById('video');
+    let currentMode = 'normal';
+
+    // SHADER SOURCE: The "Color Science" Engine
+    const vsSource = `
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0, 1);
+            v_texCoord = a_texCoord;
+        }
+    `;
+
+    const fsSource = `
+        precision mediump float;
+        varying vec2 v_texCoord;
+        uniform sampler2D u_image;
+        uniform int u_mode;
+
+        // Film Sim Math
+        vec3 applyClassicChrome(vec3 color) {
+            // 1. Desaturate
+            float luminance = dot(color, vec3(0.299, 0.587, 0.114));
+            color = mix(vec3(luminance), color, 0.7);
+            // 2. Hard S-Curve (Contrast)
+            color = smoothstep(0.0, 1.0, color * 1.1 - 0.05);
+            // 3. Teal Shift Blues
+            if(color.b > color.r && color.b > color.g) {
+                color.g += 0.05;
+            }
+            return color;
+        }
+
+        vec3 applyProvia(vec3 color) {
+            // 1. Natural Vibrance
+            color = pow(color, vec3(0.95)); // Slight brightness lift
+            // 2. Subtle Pop
+            color = mix(color, smoothstep(0.0, 1.0, color), 0.2);
+            return color;
+        }
+
+        void main() {
+            vec4 tex = texture2D(u_image, v_texCoord);
+            vec3 color = tex.rgb;
+
+            if (u_mode == 1) color = applyClassicChrome(color);
+            else if (u_mode == 2) color = applyProvia(color);
+
+            gl_FragColor = vec4(color, 1.0);
+        }
+    `;
+
+    // WEBGL SETUP LOGIC
+    function initWebGL() {
+        if (!gl) return alert("WebGL not supported");
+
+        const program = createProgram(gl, vsSource, fsSource);
+        const positionLoc = gl.getAttribLocation(program, "a_position");
+        const texCoordLoc = gl.getAttribLocation(program, "a_texCoord");
+        const modeLoc = gl.getUniformLocation(program, "u_mode");
+
+        const posBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(positionLoc);
+        gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+        const texBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(texCoordLoc);
+        gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        function render() {
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.useProgram(program);
+            
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+            
+            let modeVal = 0;
+            if(currentMode === 'chrome') modeVal = 1;
+            if(currentMode === 'provia') modeVal = 2;
+            gl.uniform1i(modeLoc, modeVal);
+            
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            requestAnimationFrame(render);
+        }
+        render();
+    }
+
+    // UTILS
+    function createProgram(gl, vs, fs) {
+        const vShader = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vShader, vs); gl.compileShader(vShader);
+        const fShader = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fShader, fs); gl.compileShader(fShader);
+        const prog = gl.createProgram();
+        gl.attachShader(prog, vShader); gl.attachShader(prog, fShader);
+        gl.linkProgram(prog); return prog;
+    }
+
+    function setMode(mode) {
+        currentMode = mode;
+        document.querySelectorAll('.mode-selector button').forEach(b => b.classList.remove('active'));
+        document.getElementById('btn-' + mode).classList.add('active');
+        document.getElementById('status').innerText = "ENGINE: " + mode.toUpperCase();
+    }
+
+    function takePhoto() {
+        const link = document.createElement('a');
+        link.download = `FujiSim_${currentMode}_${Date.now()}.png`;
+        link.href = canvas.toDataURL();
+        link.click();
+    }
+
+    // START CAMERA
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+        .then(stream => { video.srcObject = stream; video.play(); initWebGL(); })
+        .catch(err => { alert("Camera Error: " + err); });
+
+</script>
+</body>
+</html>
